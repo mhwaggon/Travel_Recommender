@@ -1,0 +1,303 @@
+import pandas as pd
+import numpy as np
+from math import radians, sin, cos, sqrt, atan2
+import pandas as pd
+import numpy as np
+import time
+import random
+import requests
+import sqlite3
+import json
+
+GEONAMES_TXT = "cities5000.txt"
+AIRPORTS_CSV = "airports.csv"
+OUT_BASE = "destinations_base.parquet"
+
+MIN_POP = 50000
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2.0) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2.0) ** 2
+    c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a))
+    return r * c
+
+cols = [
+    "geonameid","name","asciiname","alternatenames","latitude","longitude",
+    "feature_class","feature_code","country_code","cc2","admin1","admin2",
+    "admin3","admin4","population","elevation","dem","timezone","mod_date"
+]
+
+cities = pd.read_csv(GEONAMES_TXT, sep="\t", header=None, names=cols)
+cities = cities[["geonameid","name","country_code","latitude","longitude","population"]].copy()
+cities["latitude"] = cities["latitude"].astype(float)
+cities["longitude"] = cities["longitude"].astype(float)
+cities["population"] = cities["population"].fillna(0).astype(int)
+cities = cities[cities["population"] >= int(MIN_POP)].reset_index(drop=True)
+
+airports = pd.read_csv(AIRPORTS_CSV)
+airports = airports[
+    (airports["type"].isin(["large_airport","medium_airport"])) &
+    airports["latitude_deg"].notna() &
+    airports["longitude_deg"].notna()
+][["ident","name","latitude_deg","longitude_deg","iso_country"]].copy()
+
+airport_coords = airports[["ident","latitude_deg","longitude_deg"]].to_numpy()
+
+nearest_airport = []
+nearest_airport_dist_km = []
+
+print(f"Matching nearest airports for {len(cities):,} cities...", flush=True)
+
+for i, r in cities.iterrows():
+    lat = float(r["latitude"])
+    lon = float(r["longitude"])
+    dists = np.array([haversine_km(lat, lon, float(a[1]), float(a[2])) for a in airport_coords], dtype=float)
+    idx = int(np.argmin(dists))
+    nearest_airport.append(str(airport_coords[idx][0]))
+    nearest_airport_dist_km.append(float(dists[idx]))
+
+    if (i + 1) % 2000 == 0 or (i + 1) == len(cities):
+        print(f"  {i+1:,}/{len(cities):,}", flush=True)
+
+cities["nearest_airport"] = nearest_airport
+cities["nearest_airport_dist_km"] = nearest_airport_dist_km
+
+cities.to_parquet(OUT_BASE, index=False)
+print(f"Wrote {OUT_BASE} rows={len(cities):,}", flush=True)
+
+
+
+BASE_PATH = "destinations_base.parquet"
+OUT_FEATURES = "destinations_features.parquet"
+CACHE_SQLITE = "overpass_cache.sqlite"
+
+MONTH = 9
+RADIUS_M = 2000
+MAX_CITIES = 1000
+SLEEP_S = 0.35
+PRINT_EVERY = 25
+
+session = requests.Session()
+session.headers.update({"User-Agent": "travel-rec-engine/1.0", "Accept": "application/json"})
+
+def open_meteo_monthly(lat, lon, month_num):
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": float(lat),
+        "longitude": float(lon),
+        "start_date": "2023-01-01",
+        "end_date": "2023-12-31",
+        "daily": "temperature_2m_mean,precipitation_sum",
+        "timezone": "UTC"
+    }
+    r = session.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    df = pd.DataFrame({
+        "date": j["daily"]["time"],
+        "temp_c": j["daily"]["temperature_2m_mean"],
+        "precip_mm": j["daily"]["precipitation_sum"]
+    })
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[df["date"].dt.month == int(month_num)]
+    if len(df) == 0:
+        return np.nan, np.nan
+    return float(df["temp_c"].mean()), float(df["precip_mm"].sum())
+
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+    "https://overpass.nchc.org.tw/api/interpreter"
+]
+
+conn = sqlite3.connect(CACHE_SQLITE)
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS overpass_cache (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  created_ts REAL NOT NULL
+)
+""")
+conn.commit()
+
+def cache_get(key):
+    cur.execute("SELECT value FROM overpass_cache WHERE key = ?", (key,))
+    row = cur.fetchone()
+    return None if row is None else json.loads(row[0])
+
+def cache_set(key, value):
+    cur.execute("INSERT OR REPLACE INTO overpass_cache VALUES (?, ?, ?)", (key, json.dumps(value), time.time()))
+    conn.commit()
+
+def overpass_amenity_total(lat, lon, radius):
+    lat = float(lat)
+    lon = float(lon)
+    radius = int(radius)
+
+    key = f"{round(lat,3)}|{round(lon,3)}|{radius}"
+    cached = cache_get(key)
+    if cached is not None:
+        return int(cached["amenity_total"]), True
+
+    query = f"""
+    [out:json][timeout:25];
+    (
+      nwr(around:{radius},{lat},{lon})["amenity"="bar"];
+      nwr(around:{radius},{lat},{lon})["amenity"="pub"];
+      nwr(around:{radius},{lat},{lon})["amenity"="nightclub"];
+      nwr(around:{radius},{lat},{lon})["amenity"="restaurant"];
+      nwr(around:{radius},{lat},{lon})["amenity"="cafe"];
+      nwr(around:{radius},{lat},{lon})["tourism"="museum"];
+      nwr(around:{radius},{lat},{lon})["tourism"="attraction"];
+    );
+    out count;
+    """
+
+    endpoints = OVERPASS_ENDPOINTS[:]
+    random.shuffle(endpoints)
+
+    for attempt in range(1, 9):
+        endpoint = endpoints[(attempt - 1) % len(endpoints)]
+        try:
+            r = session.post(endpoint, data={"data": query}, timeout=90)
+            if r.status_code == 429:
+                raise requests.HTTPError("429")
+            r.raise_for_status()
+            j = r.json()
+            total = int(j.get("elements", [{}])[0].get("tags", {}).get("total", 0))
+            cache_set(key, {"amenity_total": total})
+            return total, False
+        except Exception:
+            time.sleep(min(30.0, (2 ** attempt)) + random.uniform(0.0, 0.5))
+
+    cache_set(key, {"amenity_total": 0})
+    return 0, False
+
+cities = pd.read_parquet(BASE_PATH).copy()
+cities = cities.sort_values("population", ascending=False).head(int(MAX_CITIES)).reset_index(drop=True)
+
+print(f"Building features: n={len(cities)} month={MONTH} radius_m={RADIUS_M}", flush=True)
+
+rows = []
+t0 = time.time()
+cache_hits = 0
+
+for i, r in cities.iterrows():
+    temp_c_avg, precip_mm_sum = open_meteo_monthly(r["latitude"], r["longitude"], MONTH)
+    amenity_total, was_cached = overpass_amenity_total(r["latitude"], r["longitude"], RADIUS_M)
+    if was_cached:
+        cache_hits += 1
+
+    rows.append({
+        "geonameid": int(r["geonameid"]),
+        "city": r["name"],
+        "country": r["country_code"],
+        "latitude": float(r["latitude"]),
+        "longitude": float(r["longitude"]),
+        "population": int(r["population"]),
+        "nearest_airport": r["nearest_airport"],
+        "nearest_airport_dist_km": float(r["nearest_airport_dist_km"]),
+        "month": int(MONTH),
+        "temp_c_avg": temp_c_avg,
+        "precip_mm_sum": precip_mm_sum,
+        "amenity_total": int(amenity_total)
+    })
+
+    if (i + 1) % int(PRINT_EVERY) == 0 or (i + 1) == len(cities):
+        elapsed = time.time() - t0
+        per = elapsed / (i + 1)
+        rem = per * (len(cities) - (i + 1))
+        print(f"[{i+1}/{len(cities)}] elapsed={elapsed:.1f}s est_remaining={rem:.1f}s cache_hits={cache_hits}", flush=True)
+
+    time.sleep(float(SLEEP_S))
+
+df_features = pd.DataFrame(rows)
+df_features.to_parquet(OUT_FEATURES, index=False)
+print(f"Wrote {OUT_FEATURES} rows={len(df_features):,}", flush=True)
+
+
+
+FEATURES_PATH = "destinations_features.parquet"
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2.0) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2.0) ** 2
+    c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a))
+    return r * c
+
+def minmax(s):
+    s = s.astype(float)
+    mn = np.nanmin(s)
+    mx = np.nanmax(s)
+    if not np.isfinite(mn) or not np.isfinite(mx) or mx == mn:
+        return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
+    return (s - mn) / (mx - mn)
+
+def recommend(
+    df,
+    origin_lat=None,
+    origin_lon=None,
+    max_distance_km=None,
+    temp_target_c=26.0,
+    temp_tolerance_c=8.0,
+    weights=None,
+    top_n=20
+):
+    w = weights or {"amenity": 0.40, "warmth": 0.35, "dryness": 0.15, "distance": 0.10}
+
+    d = df.copy()
+
+    d["amenity_log"] = np.log1p(d["amenity_total"].clip(lower=0))
+    d["amenity_score"] = minmax(d["amenity_log"])
+
+    d["temp_diff"] = (d["temp_c_avg"] - float(temp_target_c)).abs()
+    d["warmth_score"] = (1.0 - (d["temp_diff"] / float(temp_tolerance_c))).clip(lower=0.0, upper=1.0)
+
+    d["dryness_score"] = 1.0 - minmax(d["precip_mm_sum"].clip(lower=0))
+
+    if origin_lat is not None and origin_lon is not None:
+        dist = []
+        for _, r in d.iterrows():
+            dist.append(haversine_km(float(origin_lat), float(origin_lon), float(r["latitude"]), float(r["longitude"])))
+        d["distance_km"] = dist
+        d["distance_score"] = 1.0 - minmax(d["distance_km"])
+        if max_distance_km is not None:
+            d = d[d["distance_km"] <= float(max_distance_km)].copy()
+    else:
+        d["distance_km"] = np.nan
+        d["distance_score"] = 0.0
+
+    d["contrib_amenity"] = float(w["amenity"]) * d["amenity_score"].fillna(0.0)
+    d["contrib_warmth"] = float(w["warmth"]) * d["warmth_score"].fillna(0.0)
+    d["contrib_dryness"] = float(w["dryness"]) * d["dryness_score"].fillna(0.0)
+    d["contrib_distance"] = float(w["distance"]) * d["distance_score"].fillna(0.0)
+
+    d["score"] = d["contrib_amenity"] + d["contrib_warmth"] + d["contrib_dryness"] + d["contrib_distance"]
+
+    out_cols = [
+        "city","country","month","score",
+        "temp_c_avg","precip_mm_sum","amenity_total","distance_km",
+        "contrib_amenity","contrib_warmth","contrib_dryness","contrib_distance"
+    ]
+    return d.sort_values("score", ascending=False)[out_cols].head(int(top_n)).reset_index(drop=True)
+
+df = pd.read_parquet(FEATURES_PATH)
+
+top = recommend(
+    df=df,
+    origin_lat=39.7392,
+    origin_lon=-104.9903,
+    max_distance_km=9000,
+    temp_target_c=27.0,
+    temp_tolerance_c=9.0,
+    weights={"amenity": 0.40, "warmth": 0.35, "dryness": 0.15, "distance": 0.10},
+    top_n=20
+)
+
+top
